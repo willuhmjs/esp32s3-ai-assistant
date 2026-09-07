@@ -1438,7 +1438,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "esp32s3-ai-assistant"
+name = "esp32s3-voice-assistant"
 version = "0.1.0"
 dependencies = [
  "critical-section",

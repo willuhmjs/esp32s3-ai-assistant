@@ -1,11 +1,11 @@
 [package]
 edition      = "2024"
-name         = "esp32s3-ai-assistant"
+name         = "esp32s3-voice-assistant"
 rust-version = "1.88"
 version      = "0.1.0"
 
 [[bin]]
-name = "esp32s3-ai-assistant"
+name = "esp32s3-voice-assistant"
 path = "./src/bin/main.rs"
 
 [dependencies]

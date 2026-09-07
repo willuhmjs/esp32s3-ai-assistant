@@ -1,4 +1,4 @@
-# esp32s3-ai-assistant — self-hosted voice assistant firmware
+# esp32s3-voice-assistant — self-hosted voice assistant firmware
 
 Bare-metal Rust (`no_std` + `alloc`), embassy-async, running on a **Spotpear
 ESP32-S3 1.28" round touch box**. Goal: tap the screen, speak, get a spoken
@@ -9,8 +9,16 @@ the device itself. Development targets a self-hosted agent (Hermes) and
 self-hosted Speaches for STT/TTS, but the firmware knows nothing about either
 beyond the standard OpenAI paths.
 
-The repo lives at `~/custom-os` (the crate is still named
-`esp32s3-ai-assistant`).
+The repo lives at `~/custom-os`; the crate, the binary and the GitHub repo are
+all `esp32s3-voice-assistant`. Only the working directory still carries the old
+`custom-os` name.
+
+**Board compatibility.** The firmware is written against ESP32-S3 boards
+pairing a GC9A01 240x240 round LCD, a CST816x touch controller and an ES8311
+codec, and is tested on exactly one: the Spotpear `sp-esp32-s3-1.28-box`.
+Nothing in the code abstracts over boards — `src/pins.rs` is the single source
+of the GPIO map, so another board in that class is a `pins.rs` edit rather than
+a port.
 
 **Current status**: the voice pipeline works end to end — the long-running
 mic/I2S-RX bug is fixed (see "Audio, and the bug that dominated early work").
@@ -153,7 +161,7 @@ of the settings menu, which is the only place they can be fixed.
 
 Tapping "Wi-Fi Setup" is a **one-way door**: it signals `connection_task`,
 which abandons the station reconnect loop and `set_config`s the radio into
-AP mode (`voicebox-setup`, open, 192.168.4.1). The station interface is gone
+AP mode (`voice-assistant-setup`, open, 192.168.4.1). The station interface is gone
 at that point, so every exit path — saved, save-failed, no-nvs, cancelled —
 ends in `software_reset()`.
 
@@ -309,7 +317,7 @@ the S3 too, same APB-clock RMT source as the C3).
 
 Also verified: three-card swipe navigation (assistant → configure →
 settings), a tap landing on the Wi-Fi Setup row, the radio switching to
-`voicebox-setup`, cancel-and-reboot, and swipe-to-cancel during Listening
+`voice-assistant-setup`, cancel-and-reboot, and swipe-to-cancel during Listening
 (`listening loop exited: cancelled` in the serial log).
 
 **Not yet verified on hardware** (written, compiles clean):
@@ -348,7 +356,7 @@ first few seconds of boot" race from running `espflash flash` then a
 separate `cat` afterward — the first ~100ms to few seconds of boot output is
 silently dropped if nothing has the port open when the chip resets):
 ```
-espflash flash --port /dev/cu.usbmodemXXXX --monitor --non-interactive target/xtensa-esp32s3-none-elf/release/esp32s3-ai-assistant > /tmp/some.log 2>&1 &
+espflash flash --port /dev/cu.usbmodemXXXX --monitor --non-interactive target/xtensa-esp32s3-none-elf/release/esp32s3-voice-assistant > /tmp/some.log 2>&1 &
 FLASHPID=$!
 sleep 20   # however long you need
 kill $FLASHPID 2>/dev/null; wait $FLASHPID 2>/dev/null

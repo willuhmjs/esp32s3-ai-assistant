@@ -46,7 +46,7 @@ use crate::ui::{self, UiState};
 /// The AP's own address, which is also the gateway, the DNS server and the
 /// address the user types into their browser.
 pub const PORTAL_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 1);
-pub const PORTAL_SSID: &str = "voicebox-setup";
+pub const PORTAL_SSID: &str = "voice-assistant-setup";
 const PORTAL_URL: &str = "http://192.168.4.1";
 
 /// Outcome of a portal session. Both variants end in a reboot; the difference

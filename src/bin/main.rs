@@ -1116,7 +1116,7 @@ async fn main(spawner: Spawner) -> ! {
         // ----- Thinking: STT -----
         show(&mut display, &mut ui_frame, &mut status_led, &UiState::Thinking { tool: None }, 0).await;
         let wav_data = wav::wav_bytes(&pcm, AUDIO_SAMPLE_RATE);
-        let boundary = "----esp32s3-ai-assistant-boundary";
+        let boundary = "----esp32s3-voice-assistant-boundary";
         let mut body = Vec::with_capacity(wav_data.len() + 256);
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
