@@ -1,0 +1,120 @@
+[package]
+edition      = "2024"
+name         = "esp32s3-ai-assistant"
+rust-version = "1.88"
+version      = "0.1.0"
+
+[[bin]]
+name = "esp32s3-ai-assistant"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal = { version = "~1.1.0", features = ["esp32s3", "log-04", "unstable"] }
+
+esp-rtos = { version = "0.3.0", features = [
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32s3",
+  "log-04",
+] }
+
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3", "log-04"] }
+log                    = "0.4.27"
+
+# Settings persistence. Pinned to 0.9: 0.10 requires esp-hal ~1.2.0-rc.0, and
+# ws2812-rmt 0.2.0 is hard-pinned to esp-hal ~1.1.0, so bumping it breaks the
+# status LED.
+esp-storage      = { version = "0.9.0", features = ["esp32s3"] }
+embedded-storage = "0.3.1"
+
+# SoftAP setup portal. `default-features = false` deliberately drops their `io`
+# feature, which pulls in `edge-nal`/`edge-nal-embassy` - and the only released
+# edge-nal-embassy that edge-net 0.8 works with is pinned to embassy-net 0.8,
+# which would land a second, incompatible copy of embassy-net next to the 0.9
+# used everywhere else. Without `io` these are pure codecs, and `src/portal.rs`
+# drives them over embassy-net's own UDP sockets.
+edge-dhcp    = { version = "0.8.0", default-features = false }
+edge-captive = { version = "0.8.0", default-features = false }
+
+embassy-net = { version = "0.9.1", features = [
+  "dhcpv4",
+  "dns",
+  "log",
+  "medium-ethernet",
+  "tcp",
+  "udp",
+] }
+embedded-io = "0.7.1"
+embedded-io-async = "0.7.0"
+embedded-nal-async = "0.9.0"
+reqwless = { version = "0.14", default-features = false, features = ["embedded-tls", "log"] }
+# embedded-tls 0.18.0 (crates.io) needs der's "heapless" feature but doesn't
+# request it itself - force it on directly so cargo's feature unification fixes the build.
+der = { version = "0.8", default-features = false, features = ["derive", "heapless"] }
+# reqwless depends on embedded-tls without its "alloc" feature, and that feature
+# is what adds the RSA signature schemes to the ClientHello (it's just a marker
+# flag - `alloc = []`). Without them, a server presenting an RSA certificate has
+# no signature algorithm in common with us and kills the handshake with a fatal
+# handshake_failure alert - which is exactly what the Hermes host (RSA cert, private
+# CA) did, while the Speaches host (ECDSA cert) worked fine. Declared here purely so
+# cargo's feature unification turns it on for reqwless's copy too.
+embedded-tls = { version = "0.18", default-features = false, features = ["alloc"] }
+es8311 = "0.1.1"
+ws2812-rmt = { version = "0.2.0", features = ["esp32s3"] }
+lcd-async = "0.1.3"
+embedded-graphics = "0.8"
+embedded-hal = "1.0"
+embedded-hal-async = "1.0"
+embedded-hal-bus = { version = "0.3", features = ["async"] }
+heapless = "0.9"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = [
+  "esp32s3",
+  "panic-handler",
+  "println",
+] }
+esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
+# for more networking protocol support see https://crates.io/crates/edge-net
+embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-time = { version = "0.5.0", features = ["log"] }
+embassy-sync = "0.7"
+embassy-futures = "0.1"
+esp-radio = { version = "0.18.0", features = [
+  "esp-alloc",
+  "esp32s3",
+  "log-04",
+  "unstable",
+  "wifi",
+] }
+smoltcp = { version = "0.13.0", default-features = false, features = [
+  "log",
+  "medium-ethernet",
+  "multicast",
+  "proto-dhcpv4",
+  "proto-dns",
+  "proto-ipv4",
+  "socket-dns",
+  "socket-icmp",
+  "socket-raw",
+  "socket-tcp",
+  "socket-udp",
+] }
+
+critical-section = "1.2.0"
+static_cell      = "2.1.1"
+
+
+# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+# Always build with some optimizations enabled.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1     # LLVM can perform better optimizations using a single thread
+debug         = 2     # prefer slower builds but better debugging experience
+lto           = 'fat'
+opt-level     = 's'
