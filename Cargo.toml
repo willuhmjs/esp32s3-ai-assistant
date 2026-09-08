@@ -61,6 +61,25 @@ der = { version = "0.8", default-features = false, features = ["derive", "heaple
 # cargo's feature unification turns it on for reqwless's copy too.
 embedded-tls = { version = "0.18", default-features = false, features = ["alloc"] }
 es8311 = "0.1.1"
+# MP3 decode for TTS playback. The speech endpoint returns 62.8 kbps mp3 at the
+# device's own 24kHz mono, which is 6.1x less data than the wav it used to send
+# (165,096 vs 1,006,636 bytes for the same 21 seconds) - and 6.1x is the whole
+# point, because uncompressed 24kHz PCM needs 48,000 B/s and the measured
+# delivery rate over TLS during playback is 30-45,000. See `speak`.
+#
+# `default-features = false` drops `simd`, which is x86 SSE2 / ARM NEON only and
+# does nothing on xtensa. It does *not* drop `std` - rmp3's default set is just
+# `["simd"]`, and the crate is `no_std` unless `std` is asked for. Samples come
+# out as native `i16`, which is already the format the I2S path wants, so the
+# `float` feature stays off too.
+#
+# Vendored rather than taken from crates.io: rmp3 sources its C integer types
+# from `libc`, which has no bindings for a bare-metal xtensa target and so
+# compiles to an empty crate here, leaving every `libc::c_int` in its FFI module
+# unresolved. `vendor/rmp3` is 0.3.1 with those swapped for the identical
+# `core::ffi` ones and nothing else changed - see `vendor/README.md`. The C half
+# needed no patch; `cc` builds minimp3 for xtensa as-is.
+rmp3 = { path = "vendor/rmp3", default-features = false }
 ws2812-rmt = { version = "0.2.0", features = ["esp32s3"] }
 lcd-async = "0.1.3"
 embedded-graphics = "0.8"

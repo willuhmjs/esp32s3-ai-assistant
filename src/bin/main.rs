@@ -23,6 +23,7 @@ mod settings;
 mod portal;
 
 use alloc::{format, string::String, string::ToString, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_net::{
@@ -39,6 +40,7 @@ use embedded_io_async::Read as _;
 use es8311::{ClockConfig as Es8311ClockConfig, Es8311, Resolution};
 use esp_backtrace as _;
 use esp_hal::{
+    analog::adc::{Adc, AdcCalCurve, AdcConfig, Attenuation},
     clock::CpuClock,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
@@ -144,13 +146,105 @@ const AGENT_ATTEMPTS: usize = 3;
 /// answering and then giving up mid-sentence.
 const AGENT_MIN_USABLE_CHARS: usize = 40;
 
+/// How hard the model is allowed to think before answering.
+///
+/// This is the fix for open-ended questions appearing to hang. A reasoning model
+/// sent no limits will happily spend thousands of tokens on its scratchpad for
+/// something like "tell me about the history of Austria", and *neither* timeout
+/// above can catch it: `STREAM_IDLE_SECS` only fires on silence, and `reasoning`
+/// deltas keep arriving the whole time. The device sat on the Thinking card for
+/// minutes with a live stream and an empty reply.
+///
+/// "low" rather than off because gpt-oss cannot be turned off: its harmony
+/// format always emits an analysis channel, and low/medium/high are the only
+/// levels. This is the floor, not a disable.
+///
+/// **Backend caveat**: unlike everything else this firmware sends, this is not a
+/// universal OpenAI field. Servers that reject unknown body fields will answer
+/// 400 to every request. If a future endpoint does that, this and `max_tokens`
+/// are the two fields to drop.
+const AGENT_REASONING_EFFORT: &str = "low";
+/// Hard ceiling on a reply, as a backstop to `AGENT_REASONING_EFFORT`.
+///
+/// Counts the scratchpad as well as the answer on every server seen, which is
+/// the point: it bounds the worst case even if `reasoning_effort` is ignored.
+///
+/// Deliberately far above what a good turn needs. Three sentences is about 90
+/// tokens, and with `reasoning_effort` doing its job the observed scratchpad is
+/// 50-340 characters, so a real reply lands nowhere near this. The ceiling is
+/// only here to stop an unbounded think, and a *tight* ceiling is the worse
+/// failure: the budget is shared with reasoning, so a model that decides to
+/// think hard would spend it all before writing a word and return
+/// `finish_reason: "length"` with empty content. That reads to the user as the
+/// device having nothing to say. 2048 makes that essentially impossible while
+/// still capping the runaway case.
+const AGENT_MAX_TOKENS: u32 = 2048;
+
 /// Minimum audio buffered before the first sample is played, at 24kHz/16-bit
 /// mono - 48,000 bytes is one second. A floor, not the whole rule: `speak` also
 /// refuses to start until the clip is *projected* to finish downloading before
 /// it finishes playing (see the prebuffer comment there). This value only has
 /// to absorb jitter around a delivery rate that is already fast enough, so it
 /// is deliberately small - every byte is latency the user waits through.
+///
+/// Counted in *decoded* bytes, which since the switch to mp3 is no longer the
+/// same as bytes off the wire: one second of audio is 48,000 bytes here but
+/// only about 7,900 on the socket, so this floor is now reached in roughly a
+/// fifth of a second instead of the one-to-two seconds it used to cost.
 const TTS_PREBUFFER_BYTES: usize = 48_000;
+/// Encoding asked of the speech endpoint.
+///
+/// This used to be `wav`, and the change is the single biggest latency fix in
+/// the playback path. Uncompressed 24kHz 16-bit mono PCM is 48,000 B/s, and the
+/// measured delivery rate over TLS *while audio is playing* is 30-45,000 - the
+/// download lost that race on every clip ever logged, so `speak` had to sit
+/// through a prebuffer that grew with the length of the reply (5.9 seconds on
+/// one 358KB clip). The endpoint's mp3 is 62.8 kbps at the same 24kHz mono, or
+/// about 7,900 B/s: 6.1x less data for the identical 21 seconds of audio
+/// (165,096 bytes against 1,006,636), which turns a permanent deficit into 6x
+/// of headroom and collapses the prebuffer to the floor above.
+///
+/// Of the four formats this server offers - it rejects everything else with a
+/// 422 naming `'mp3', 'flac', 'wav', 'pcm'` - mp3 is the only one that helps:
+/// flac is a mere 1.8x and would still be losing, and `pcm`/`wav` are the same
+/// bytes with and without a header. It is also the only one that needs no
+/// resampling, since the encoder keeps the 24kHz rate the I2S path is fixed at.
+///
+/// **What this deliberately does not fix.** The other half of TTS latency is
+/// the server rendering the whole clip before it sends a byte (time-to-first-
+/// byte measured equal to total time on every format, and a `stream_format`
+/// hint is accepted and ignored). The only way to cut that from this side is a
+/// request per sentence, which buys a seam in the audio at every sentence
+/// boundary and a prosody reset either side of it. One request, one synthesis
+/// pass, one continuous stream is worth more than the seconds.
+const TTS_RESPONSE_FORMAT: &str = "mp3";
+/// How many times to ask the speech endpoint for the same clip before giving up.
+///
+/// Same reasoning as `AGENT_ATTEMPTS`, for the same host: a request can connect
+/// and complete its TLS handshake and then simply never be answered. That was
+/// seen once in a six-turn session, on a 62-character reply the server renders
+/// in a measured 1.0s six times out of six when asked again. Only the phase
+/// before any audio plays is retried - once the speaker has started, a second
+/// attempt would restart the clip from the beginning.
+const TTS_ATTEMPTS: usize = 2;
+
+/// How long to wait for the speech endpoint's response headers, given the
+/// length of the text being synthesized.
+///
+/// A flat number cannot be right here: this server renders the whole clip
+/// before it sends a byte, so the wait is proportional to the reply. Measured
+/// on-device at roughly 12.6ms per character (8216ms for 652 characters, the
+/// longest of that session, against 1705ms for 128). The 25ms slope is double
+/// that, so a legitimate reply has to be twice as slow as ever observed before
+/// this fires.
+///
+/// The point of scaling it is the retry. At the flat `STREAM_STALL_SECS` a
+/// stalled short reply cost 30 seconds of silence before the second attempt
+/// even started, which is worse than the failure it is fixing; at 25ms/char
+/// that same reply gives up after about six.
+fn tts_send_budget(chars: usize) -> Duration {
+    Duration::from_millis((5_000 + 25 * chars as u64).min(STREAM_STALL_SECS * 1000))
+}
 /// `(write size in bytes, seconds)` for each leg of the boot tone sweep; empty
 /// disables it, which is the normal setting - it beeps for six seconds at every
 /// boot. See `test_tone`: this is the only way to hear the audio path with the
@@ -171,10 +265,11 @@ const AGENT_TRACE_LINES: usize = 0;
 /// allowed to fall without the speaker running dry. Also covers the estimate
 /// being wrong about the clip's total length.
 const TTS_START_MARGIN_MS: u64 = 2_000;
-/// Rough bytes of 24kHz PCM per character of input text, used only to advance
-/// captions when the server tells us neither a Content-Length nor a real WAV
-/// data size. Measured at 2,965 on this voice; being wrong here just means the
-/// captions drift, never that the audio is wrong.
+/// Rough bytes of decoded 24kHz PCM per character of input text, used only when
+/// the server sends no Content-Length: it stands in for the clip's total length
+/// in the streaming projection and in the caption timing. Measured at 2,965 on
+/// this voice; being wrong here just means the captions drift, never that the
+/// audio is wrong.
 const TTS_BYTES_PER_CHAR: usize = 2_900;
 
 /// Volume step per tap on the settings volume row.
@@ -245,6 +340,10 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a Vec<ChatMessage>,
     stream: bool,
+    /// See `AGENT_REASONING_EFFORT`.
+    reasoning_effort: &'a str,
+    /// See `AGENT_MAX_TOKENS`.
+    max_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -379,6 +478,31 @@ async fn main(spawner: Spawner) -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
     spawner.spawn(button_task(boot_button).expect("spawn button_task"));
+
+    // ---------- Battery sense (ADC1_CH0 on GPIO1, charge status on GPIO41) ----------
+    // ADC1 specifically, and that is not an accident of the pin map: ADC2 on
+    // this chip is shared with the WiFi radio and cannot be read while the
+    // radio is up. A battery gauge on ADC2 would have been unusable in exactly
+    // the state the device spends all its time in.
+    //
+    // 11dB attenuation for the widest input range (~3.1V full scale), because
+    // a 4.2V cell behind a 2:1 divider is 2.1V and every lower setting would
+    // clip it. `AdcCalCurve` uses this chip's own efuse calibration data, so
+    // the reading comes back in millivolts without a hand-fitted correction.
+    let mut adc_config = AdcConfig::new();
+    let battery_pin = adc_config
+        .enable_pin_with_cal::<_, AdcCalCurve<_>>(peripherals.GPIO1, Attenuation::_11dB);
+    let battery_adc = Adc::new(peripherals.ADC1, adc_config);
+    // Pulled up on the assumption this is an open-drain /CHG output. If the
+    // charger drives it push-pull the pull-up is harmless either way.
+    let charge_pin = Input::new(
+        peripherals.GPIO41,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    spawner.spawn(
+        battery_probe_task(battery_adc, battery_pin, charge_pin)
+            .expect("spawn battery_probe_task"),
+    );
 
     // ---------- Status LED (WS2812 on GPIO48) ----------
     // Matches the factory firmware's color scheme: blue while connecting,
@@ -922,7 +1046,15 @@ async fn main(spawner: Spawner) -> ! {
             &mut display,
             &mut ui_frame,
             &mut status_led,
-            &UiState::Idle { wifi_ok, exchanges: exchange_count(&history) },
+            &UiState::Idle {
+                wifi_ok,
+                exchanges: exchange_count(&history),
+                // Read at redraw time rather than pushed from the sampler: the
+                // idle card can sit here for twenty seconds, and it is the only
+                // place the gauge is shown, so there is nothing to update in
+                // between.
+                battery: battery_reading(),
+            },
             anim,
         )
         .await;
@@ -1105,6 +1237,11 @@ async fn main(spawner: Spawner) -> ! {
                 &mut display,
                 &mut ui_frame,
                 &mut status_led,
+                // 20 chars, against the Error card's 22-char budget: 120px of
+                // FONT_6X10 centered on a line where the inscribed circle
+                // allows 188px, so ~34px of gutter each side. The apostrophe
+                // costs nothing - it is plain ASCII 0x27 and the ascii font has
+                // a glyph for it, same as `speakable()` relies on for replies.
                 &UiState::Error("didn't hear anything".into()),
                 0,
             )
@@ -1225,7 +1362,13 @@ async fn main(spawner: Spawner) -> ! {
         history.push(ChatMessage { role: "user".into(), content: transcript });
 
         // ----- Thinking: agent (streaming) -----
-        let chat_req = ChatRequest { model: &agent_model, messages: &history, stream: true };
+        let chat_req = ChatRequest {
+            model: &agent_model,
+            messages: &history,
+            stream: true,
+            reasoning_effort: AGENT_REASONING_EFFORT,
+            max_tokens: AGENT_MAX_TOKENS,
+        };
         let chat_body = serde_json::to_vec(&chat_req).expect("serialize chat request");
 
         let mut assistant_text = String::new();
@@ -1288,8 +1431,16 @@ async fn main(spawner: Spawner) -> ! {
                 let mut rx_buf2 = vec![0u8; 8192];
                 // `send` doesn't return until the response headers arrive, so
                 // on a slow model this is a long wait with nothing on screen.
+                // Bounded, unlike before. The TTS path has always wrapped its
+                // `send` in this timeout; the agent path did not, so a server
+                // that accepted the request and then never produced response
+                // headers left the turn resumable only by a swipe. Every other
+                // network await in this file has a deadline - this was the hole.
                 let sent = embassy_futures::select::select3(
-                    req.send(&mut rx_buf2),
+                    embassy_time::with_timeout(
+                        Duration::from_secs(STREAM_STALL_SECS),
+                        req.send(&mut rx_buf2),
+                    ),
                     wait_for_swipe(),
                     animate(
                         &mut display,
@@ -1302,7 +1453,11 @@ async fn main(spawner: Spawner) -> ! {
                 )
                 .await;
                 let sent = match sent {
-                    embassy_futures::select::Either3::First(r) => Some(r),
+                    embassy_futures::select::Either3::First(Ok(r)) => Some(r),
+                    embassy_futures::select::Either3::First(Err(_)) => {
+                        println!("agent send stalled - no response headers for {STREAM_STALL_SECS}s");
+                        None
+                    }
                     embassy_futures::select::Either3::Second(()) => {
                         cancelled_turn = true;
                         None
@@ -1316,8 +1471,11 @@ async fn main(spawner: Spawner) -> ! {
                         let t_send = t_agent.elapsed().as_millis();
                         let mut reader = response.body().reader();
                         let mut chunk = [0u8; 512];
-                        let mut line = String::new();
+                        // Raw bytes, not a String: see the decode below.
+                        let mut line: Vec<u8> = Vec::new();
                         let mut current_event: Option<String> = None;
+                        let mut next_progress =
+                            embassy_time::Instant::now() + Duration::from_secs(5);
                         let mut done = false;
                         // Latest tool-progress label, so the spinner below can
                         // keep redrawing it instead of it vanishing on the next
@@ -1404,21 +1562,61 @@ async fn main(spawner: Spawner) -> ! {
                                 SPINNER_FRAME_MS,
                             )
                             .await;
+                            // A heartbeat, because a reasoning model makes
+                            // "still working" and "wedged" look identical from
+                            // the outside: neither timeout above can fire while
+                            // `reasoning` deltas keep arriving, so a long think
+                            // is minutes of a spinner and a silent log. Printing
+                            // the split between reasoning and reply chars is what
+                            // distinguishes "the model is still thinking" from
+                            // "the stream died", and it is the only way to see
+                            // reasoning length at all - the `sse:` trace above is
+                            // capped and gets spent before the first reply token.
+                            if embassy_time::Instant::now() >= next_progress {
+                                next_progress =
+                                    embassy_time::Instant::now() + Duration::from_secs(5);
+                                println!(
+                                    "agent streaming: {}s, {data_lines} lines, {reasoning_chars} reasoning chars, {} reply chars",
+                                    t_agent.elapsed().as_secs(),
+                                    assistant_text.len(),
+                                );
+                            }
                             for &b in &chunk[..n] {
                                 if b != b'\n' {
                                     if b != b'\r' {
-                                        line.push(b as char);
+                                        line.push(b);
                                     }
                                     continue;
                                 }
                                 if line.is_empty() {
                                     current_event = None;
-                                    line.clear();
                                     continue;
                                 }
-                                if let Some(rest) = line.strip_prefix("event: ") {
+                                // Decode the completed line as UTF-8, once.
+                                //
+                                // This used to accumulate `b as char`, which is a
+                                // *Latin-1* decode: it maps each byte to the
+                                // codepoint of the same value. Every multi-byte
+                                // UTF-8 sequence therefore arrived as one char per
+                                // byte, so the model's `'` (U+2019, bytes E2 80 99)
+                                // reached `speakable` as `â` + U+0080 + U+0099 -
+                                // three characters with no ASCII fold and no glyph,
+                                // which its final `_ => ""` arm dropped. The result
+                                // was every curly apostrophe, quote and dash
+                                // silently vanishing from the caption and the
+                                // speech: "I'll" was spoken and drawn as "Ill".
+                                //
+                                // Splitting on b'\n'/b'\r' before decoding is safe:
+                                // a UTF-8 continuation byte is always >= 0x80, so a
+                                // multi-byte sequence can never contain either.
+                                // `from_utf8_lossy` rather than a hard error so a
+                                // sequence genuinely split across two TLS reads
+                                // costs one replacement char, not the whole line.
+                                let text = String::from_utf8_lossy(&line);
+                                let text = text.as_ref();
+                                if let Some(rest) = text.strip_prefix("event: ") {
                                     current_event = Some(rest.to_string());
-                                } else if let Some(rest) = line.strip_prefix("data: ") {
+                                } else if let Some(rest) = text.strip_prefix("data: ") {
                                     got_response = true;
                                     data_lines += 1;
                                     if rest == "[DONE]" {
@@ -1543,7 +1741,17 @@ async fn main(spawner: Spawner) -> ! {
 
         // One pass here covers everything downstream: the TTS request body, the
         // captions `speak` cuts out of it, and the copy that goes into history.
-        let assistant_text = speakable(&assistant_text);
+        //
+        // Logged either side of the fold. `speakable` is the only thing standing
+        // between the model and the screen, so a character that goes missing is
+        // either never sent or dropped right here - and the `sse:` trace above
+        // cannot settle it, because a reasoning model spends the whole
+        // AGENT_TRACE_LINES budget on `reasoning` deltas before the first
+        // `content` one ever arrives.
+        let raw_reply = assistant_text;
+        let assistant_text = speakable(&raw_reply);
+        println!("reply raw: {raw_reply}");
+        println!("reply out: {assistant_text}");
 
         if cancelled_turn {
             println!("turn cancelled during reply");
@@ -1561,23 +1769,36 @@ async fn main(spawner: Spawner) -> ! {
             continue;
         }
 
+        let mut spoken = SpeakOutcome::Done;
         if !assistant_text.trim().is_empty() {
-            let interrupted = speak(
-                &mut tts_client,
-                &tts_url,
-                &tts_auth,
-                &tts_model,
-                &assistant_text,
-                &mut i2s_tx,
-                tx_buffer,
-                &mut pa_enable,
-                &mut status_led,
-                &mut display,
-                &mut ui_frame,
-                anim,
-            )
-            .await;
-            if interrupted {
+            // Retried here rather than inside `speak` for a borrow-checker
+            // reason, not a stylistic one: the response borrows the request,
+            // which borrows the client, so a second attempt cannot be made
+            // without first dropping everything the first one built. Returning
+            // out of the function does that for free. Re-running the caption
+            // split costs nothing next to a network round trip.
+            for attempt in 1..=TTS_ATTEMPTS {
+                spoken = speak(
+                    &mut tts_client,
+                    &tts_url,
+                    &tts_auth,
+                    &tts_model,
+                    &assistant_text,
+                    &mut i2s_tx,
+                    tx_buffer,
+                    &mut pa_enable,
+                    &mut status_led,
+                    &mut display,
+                    &mut ui_frame,
+                    anim,
+                )
+                .await;
+                if spoken != SpeakOutcome::Failed {
+                    break;
+                }
+                println!("TTS attempt {attempt}/{TTS_ATTEMPTS} produced no audio");
+            }
+            if spoken == SpeakOutcome::Interrupted {
                 println!("reply interrupted by tap");
                 drain_taps();
             }
@@ -1586,7 +1807,16 @@ async fn main(spawner: Spawner) -> ! {
         // Whatever the model managed to say before being cut off still counts
         // as its turn - dropping it would leave the history inconsistent with
         // what the user actually heard.
-        if got_response && !assistant_text.trim().is_empty() {
+        //
+        // A reply that was never spoken at all is the opposite case, and both
+        // halves of the exchange come back out: the model must not carry an
+        // answer the user never heard, and the question that produced it is
+        // about to be asked again, so leaving it in would duplicate it.
+        if spoken == SpeakOutcome::Failed {
+            history.pop();
+            show(&mut display, &mut ui_frame, &mut status_led, &UiState::Error("no audio".into()), 0).await;
+            Timer::after(Duration::from_secs(2)).await;
+        } else if got_response && !assistant_text.trim().is_empty() {
             history.push(ChatMessage { role: "assistant".into(), content: assistant_text });
         } else {
             show(&mut display, &mut ui_frame, &mut status_led, &UiState::Error("no response".into()), 0).await;
@@ -2129,6 +2359,143 @@ fn system_message() -> ChatMessage {
 /// (`HttpClient::resource`), not a smaller chunk size.
 const _: () = ();
 
+/// Streaming mp3-to-PCM adapter for the TTS response body.
+///
+/// See [`TTS_RESPONSE_FORMAT`] for why the body is mp3 at all. This sits
+/// between the socket and the buffer `speak`'s player reads from, so everything
+/// downstream of it - the projection, the captions, the DMA staging copy, the
+/// waveform analysis in the log - still sees one growing run of little-endian
+/// i16 at [`AUDIO_SAMPLE_RATE`], exactly as it did when the server sent wav.
+///
+/// Feeding and decoding are separate calls on purpose; see [`Self::decode_frame`].
+struct Mp3Stream {
+    dec: rmp3::RawDecoder,
+    /// Bytes received that don't yet make up a whole frame. minimp3 consumes
+    /// whole frames only and reports nothing consumed when the buffer is short,
+    /// so the remainder has to survive until the next socket read tops it up.
+    raw: Vec<u8>,
+    /// Decode scratch, 4.5KB of it. A field rather than a local in
+    /// `decode_frame` so that it lives on the heap with the rest of the struct:
+    /// this file has a history with stack overflow, and `main`'s discretionary
+    /// internal-SRAM pool is 8KB.
+    scratch: [rmp3::Sample; rmp3::MAX_SAMPLES_PER_FRAME],
+    /// Compressed bytes fed in. The delivery-rate accounting has to be done in
+    /// these rather than in decoded output, or every rate reads 6x too well.
+    compressed: usize,
+    /// `(sample rate, channels)` off the first frame, reported once at the end
+    /// so a server that quietly changes encoder settings is visible in the log
+    /// rather than audible as a wrong-speed voice.
+    format: Option<(u32, u16)>,
+    frames: usize,
+}
+
+impl Mp3Stream {
+    fn new() -> Self {
+        Self {
+            dec: rmp3::RawDecoder::new(),
+            // Comfortably over the decode watermark, so the reservoir settles
+            // at its steady-state size without reallocating on the way.
+            raw: Vec::with_capacity(8192),
+            scratch: [0; rmp3::MAX_SAMPLES_PER_FRAME],
+            compressed: 0,
+            format: None,
+            frames: 0,
+        }
+    }
+
+    /// Hands one socket read to the decoder. Decodes nothing by itself.
+    fn feed(&mut self, bytes: &[u8]) {
+        self.compressed += bytes.len();
+        self.raw.extend_from_slice(bytes);
+    }
+
+    /// Decodes at most *one* frame, appending its PCM to `pcm`. Returns whether
+    /// it made progress, so a caller draining the reservoir loops until false.
+    ///
+    /// Pass `flush` only once the body has ended; see the watermark below.
+    ///
+    /// One frame per call, rather than "decode everything buffered", because of
+    /// what runs alongside this during playback. A 2KB read holds about eleven
+    /// frames, and decoding all of them is one unbroken stretch of synchronous
+    /// work on a cooperative single-core executor - if the TX DMA happens to
+    /// complete partway through it, nothing refills the FIFO until it returns,
+    /// and with `I2S_TX_STOP_EN` cleared a drained FIFO is not silence, it is
+    /// the last sample held as a buzz. A frame is ~24ms of audio, so bounding
+    /// the work at one lets the caller yield between frames and keeps the worst
+    /// case in the same range as the sub-millisecond gaps already measured
+    /// between DMA writes.
+    fn decode_frame(&mut self, pcm: &mut Vec<u8>, flush: bool) -> bool {
+        // The watermark, and the whole reason this is not just "decode whatever
+        // is buffered".
+        //
+        // minimp3 cannot be asked "is there a whole frame here yet?". Handed a
+        // buffer that ends mid-frame, `mp3dec_decode_frame` reports the *entire
+        // buffer* as consumed (`info->frame_bytes = i`, with `i == mp3_bytes`
+        // out of `mp3d_find_frame`) while decoding nothing - so acting on that
+        // byte count throws the partial frame away. It also `memset`s the whole
+        // decoder struct on the way in, which wipes the bit reservoir and the
+        // MDCT overlap that the *next* good frame is decoded against. Between
+        // them that would corrupt the audio at every socket-read boundary,
+        // several times a second.
+        //
+        // Neither is detectable after the fact, so the call is simply not made
+        // until a complete frame must be present. `MAX_FREE_FORMAT_FRAME_SIZE`
+        // is minimp3's own 2304-byte ceiling on a frame, and `mp3d_match_frame`
+        // wants one header beyond it. This endpoint's frames are ~190 bytes, so
+        // in practice this holds a quarter-second of audio in reserve and
+        // decodes in bursts of about a dozen frames - which the 6x download
+        // headroom absorbs, and which `flush` releases at the end of the body.
+        const WATERMARK: usize = 2304 + 4;
+        if !flush && self.raw.len() < WATERMARK {
+            return false;
+        }
+        // Three disjoint fields, which the borrow checker splits happily
+        // because they are named directly.
+        let Some((frame, skip)) = self.dec.next(&self.raw[..], &mut self.scratch) else {
+            // Nothing at all in the reservoir - it is empty or shorter than a
+            // header. Nothing was consumed.
+            return false;
+        };
+        // minimp3 only reports a frame alongside a nonzero byte count, but a
+        // zero here would spin this loop forever, so it is checked rather than
+        // assumed.
+        if skip == 0 {
+            return false;
+        }
+        if let rmp3::Frame::Audio(audio) = frame {
+            let channels = audio.channels().max(1);
+            if self.format.is_none() {
+                self.format = Some((audio.sample_rate(), channels));
+            }
+            self.frames += 1;
+            let samples = audio.samples();
+            if channels == 1 {
+                for s in samples {
+                    pcm.extend_from_slice(&s.to_le_bytes());
+                }
+            } else {
+                // Interleaved. Take the first channel: the I2S path is mono, and
+                // handing it interleaved stereo would play the reply at double
+                // speed - a far worse artefact than dropping a channel this
+                // endpoint is not supposed to be sending in the first place.
+                for s in samples.iter().step_by(channels as usize) {
+                    pcm.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+        }
+        // Anything else is an ID3 tag or padding: consumed, not decoded.
+        self.raw.drain(..skip);
+        true
+    }
+
+    /// Drains everything currently decodable. Only safe to call when no audio
+    /// is playing - during playback use [`Self::decode_frame`] with a yield
+    /// between calls, for the reason given there.
+    fn decode_all(&mut self, pcm: &mut Vec<u8>, flush: bool) {
+        while self.decode_frame(pcm, flush) {}
+    }
+}
+
 /// Paints one step of the startup progress ring.
 async fn boot_screen<DI, RST>(
     display: &mut lcd_async::Display<DI, GC9A01, RST>,
@@ -2142,8 +2509,26 @@ async fn boot_screen<DI, RST>(
     ui::render(display, ui_frame, &UiState::Boot { step, progress }, 0).await;
 }
 
-/// Speaks one sentence. Returns `true` if the user tapped the screen to cut it
-/// off, which the caller uses to abandon the rest of the reply.
+/// How a call to [`speak`] ended.
+///
+/// This used to be a bare `bool` meaning "interrupted", which made every
+/// failure path indistinguishable from a clean finish: a request that never
+/// got a response returned the same `false` as a reply spoken end to end. On
+/// the device that showed up as the assistant going silent for no stated
+/// reason - the reply was on screen and in history, but nothing was said and
+/// nothing was retried. `Failed` exists so the caller can tell those apart.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum SpeakOutcome {
+    /// Played to the end.
+    Done,
+    /// The user tapped to cut it off - the caller abandons the rest of the reply.
+    Interrupted,
+    /// Nothing was heard. No audio ever reached the speaker, so there is
+    /// nothing partial to keep and the attempt is safe to repeat.
+    Failed,
+}
+
+/// Speaks one reply, streaming it as it downloads.
 #[allow(clippy::too_many_arguments)]
 async fn speak<'a, C, DI, RST>(
     client: &mut HttpClient<'a, C, DnsSocket<'a>>,
@@ -2158,7 +2543,7 @@ async fn speak<'a, C, DI, RST>(
     display: &mut lcd_async::Display<DI, GC9A01, RST>,
     ui_frame: &mut [u8],
     anim: u32,
-) -> bool
+) -> SpeakOutcome
 where
     C: embedded_nal_async::TcpConnect,
     DI: lcd_async::interface::Interface<Word = u8>,
@@ -2166,7 +2551,8 @@ where
 {
     let text = text.trim();
     if text.is_empty() {
-        return false;
+        // Not a failure: there was nothing to say, so retrying would say it again.
+        return SpeakOutcome::Done;
     }
 
     // Split the reply into captions up front. The audio is one clip, so the
@@ -2199,8 +2585,9 @@ where
     }
     let total_len = acc.max(1);
 
-    let tts_req = TtsRequest { model: tts_model, input: text, voice: TTS_VOICE, response_format: "wav" };
-    let Ok(tts_body) = serde_json::to_vec(&tts_req) else { return false };
+    let tts_req =
+        TtsRequest { model: tts_model, input: text, voice: TTS_VOICE, response_format: TTS_RESPONSE_FORMAT };
+    let Ok(tts_body) = serde_json::to_vec(&tts_req) else { return SpeakOutcome::Failed };
 
     // Still Thinking until there is actually audio to play. Switching to the
     // Speaking card here instead made the device look like it had started
@@ -2224,11 +2611,12 @@ where
     .await
     {
         embassy_futures::select::Either::First(r) => r,
-        embassy_futures::select::Either::Second(()) => return false,
+        // `animate` loops forever, so this arm exists only for exhaustiveness.
+        embassy_futures::select::Either::Second(()) => return SpeakOutcome::Failed,
     };
     let Ok(Ok(req)) = connect else {
         println!("TTS request build error/timeout");
-        return false;
+        return SpeakOutcome::Failed;
     };
     let t_connect = t0.elapsed().as_millis();
     let body_slice: &[u8] = &tts_body;
@@ -2240,23 +2628,27 @@ where
     let mut req = req.body(body_slice).headers(&headers);
     let mut rx_buf = vec![0u8; 4096];
     let sent = match embassy_futures::select::select(
-        embassy_time::with_timeout(Duration::from_secs(STREAM_STALL_SECS), req.send(&mut rx_buf)),
+        embassy_time::with_timeout(tts_send_budget(text.len()), req.send(&mut rx_buf)),
         animate(display, ui_frame, led, &mut tick, &mut next_frame, &fetching),
     )
     .await
     {
         embassy_futures::select::Either::First(r) => r,
-        embassy_futures::select::Either::Second(()) => return false,
+        // `animate` loops forever, so this arm exists only for exhaustiveness.
+        embassy_futures::select::Either::Second(()) => return SpeakOutcome::Failed,
     };
     let response = match sent {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             println!("TTS send error: {e:?}");
-            return false;
+            return SpeakOutcome::Failed;
         }
         Err(_) => {
-            println!("TTS send stalled - no response for {STREAM_STALL_SECS}s");
-            return false;
+            println!(
+                "TTS send stalled - no response for {}s",
+                tts_send_budget(text.len()).as_secs()
+            );
+            return SpeakOutcome::Failed;
         }
     };
     let t_send = t0.elapsed().as_millis();
@@ -2288,46 +2680,59 @@ where
     // short replies keep the halved time-to-first-word.
     let content_length = response.content_length;
     let mut reader = response.body().reader();
+    // `clip` holds *decoded* PCM; `mp3` owns the compressed bytes behind it and
+    // the decoder state. Boxed because between the minimp3 working set and the
+    // frame scratch it is about 11KB, which has no business on the stack.
+    let mut mp3 = alloc::boxed::Box::new(Mp3Stream::new());
     let mut clip: Vec<u8> = Vec::with_capacity(TTS_PREBUFFER_BYTES * 2);
     let mut eof = false;
 
     // Prebuffer. This is the only part the user waits through, and it still
     // animates and still honours the stall timeout.
-    let mut plan: Option<(usize, usize)> = None; // (data start, total PCM bytes)
+    let mut plan: Option<usize> = None; // total PCM bytes expected
     {
         let mut chunk = [0u8; 2048];
         loop {
             if eof {
                 break;
             }
-            // The projection needs the WAV header, so it can only be evaluated
-            // once the floor is met - which costs nothing, since starting
-            // before the floor is a bad idea regardless of the arithmetic.
+            // Only evaluated once the floor is met, which costs nothing:
+            // starting before the floor is a bad idea regardless of the
+            // arithmetic, and the projection needs some decoded output to
+            // measure the expansion ratio against.
             if clip.len() >= TTS_PREBUFFER_BYTES {
-                let (data_start, total_pcm) = *plan.get_or_insert_with(|| {
-                    let data_start = wav::find_data_chunk(&clip);
-                    // Content-Length is exact when the server sends one; the
-                    // WAV header's own data size is the fallback (rejected by
-                    // `data_chunk_len` when it's a streaming placeholder); and
-                    // a rate estimate from the text is the last resort.
-                    let total_pcm = content_length
-                        .map(|cl| cl.saturating_sub(data_start))
-                        .filter(|n| *n > 0)
-                        .or_else(|| wav::data_chunk_len(&clip))
-                        .unwrap_or(text.len() * TTS_BYTES_PER_CHAR)
-                        .max(1);
-                    (data_start, total_pcm)
-                });
+                // The two sides of this are now in different currencies - the
+                // download is compressed bytes, playback is decoded PCM - so
+                // they are converted through the expansion ratio *observed so
+                // far* rather than a hardcoded bitrate. That self-calibrates,
+                // covers a server that changes encoder settings, and is why
+                // nothing here needs to know what 62.8 kbps is.
+                //
+                // In u64 throughout: `usize` is 32 bits on this target and
+                // `pcm * compressed` overflows it on any reply of real length.
+                let got_raw = (mp3.compressed as u64).max(1);
+                let got_pcm = clip.len() as u64;
+                let (total_raw, total_pcm) = match content_length.filter(|cl| *cl > 0) {
+                    // Content-Length is exact, and it counts compressed bytes.
+                    Some(cl) => (cl as u64, got_pcm * cl as u64 / got_raw),
+                    // No Content-Length: estimate the decoded length from the
+                    // text and run the ratio backwards to get the compressed
+                    // one, so the projection still has both sides.
+                    None => {
+                        let pcm = ((text.len() * TTS_BYTES_PER_CHAR) as u64).max(got_pcm);
+                        (pcm * got_raw / got_pcm, pcm)
+                    }
+                };
+                let total_pcm = total_pcm.max(got_pcm);
                 // Average delivery rate since the response headers landed,
                 // recomputed every chunk so a server that speeds up gets
                 // noticed instead of being judged on its slowest moment.
                 let ms = t0.elapsed().as_millis().saturating_sub(t_send).max(1);
-                let rate = (clip.len() as u64 * 1000 / ms).max(1);
-                let left_to_get = (data_start + total_pcm).saturating_sub(clip.len());
-                let left_to_play = total_pcm.saturating_sub(clip.len().saturating_sub(data_start));
-                let download_ms = left_to_get as u64 * 1000 / rate;
-                let playback_ms = left_to_play as u64 * 1000 / (AUDIO_SAMPLE_RATE as u64 * 2);
+                let rate = (got_raw * 1000 / ms).max(1);
+                let download_ms = total_raw.saturating_sub(got_raw) * 1000 / rate;
+                let playback_ms = (total_pcm - got_pcm) * 1000 / (AUDIO_SAMPLE_RATE as u64 * 2);
                 if download_ms + TTS_START_MARGIN_MS <= playback_ms {
+                    plan = Some(total_pcm as usize);
                     break;
                 }
             }
@@ -2341,7 +2746,8 @@ where
             .await
             {
                 embassy_futures::select::Either::First(r) => r,
-                embassy_futures::select::Either::Second(()) => return false,
+                // `animate` loops forever, so this arm exists only for exhaustiveness.
+                embassy_futures::select::Either::Second(()) => return SpeakOutcome::Failed,
             };
             // Same fast-path problem as the reply stream: while the body is
             // arriving the read always wins the select, so the frame has to be
@@ -2350,7 +2756,13 @@ where
                 .await;
             match read {
                 Ok(Ok(0)) => eof = true,
-                Ok(Ok(n)) => clip.extend_from_slice(&chunk[..n]),
+                // Nothing is playing yet, so the whole reservoir can be drained
+                // in one go here - the yield-per-frame discipline only matters
+                // once the DMA is running.
+                Ok(Ok(n)) => {
+                    mp3.feed(&chunk[..n]);
+                    mp3.decode_all(&mut clip, false);
+                }
                 Ok(Err(e)) => {
                     println!("TTS body read error: {e:?}");
                     eof = true;
@@ -2362,34 +2774,37 @@ where
             }
         }
     }
+    // Every exit from that loop other than the projection is an end of body -
+    // clean, errored or stalled - so release the watermark and take the tail.
+    // A short reply that finished inside the prebuffer floor is *entirely* in
+    // the reservoir at this point, and without this it would play as silence.
+    if eof {
+        mp3.decode_all(&mut clip, true);
+    }
     let t_prebuffer = t0.elapsed().as_millis();
+    // Snapshotted here because `mp3.compressed` keeps growing through playback,
+    // and the prebuffer rate has to be measured over the prebuffer alone.
+    let raw_at_prebuffer = mp3.compressed;
 
-    // A clip short enough to finish inside the floor never reached the
-    // projection, so it has no plan to reuse.
-    let data_start = match plan {
-        Some((d, _)) => d,
-        None => wav::find_data_chunk(&clip),
-    };
-    if clip.len() <= data_start {
-        println!("TTS returned no audio ({} bytes)", clip.len());
-        return false;
+    if clip.is_empty() {
+        println!("TTS decoded no audio from {} bytes", mp3.compressed);
+        return SpeakOutcome::Failed;
     }
     // Total PCM length, used to map playback position onto a caption. With the
     // body already complete its real length beats any estimate; mid-stream the
     // projection's estimate is all there is. Being wrong here only drifts the
     // captions, never the audio.
-    let total_pcm = if eof {
-        clip.len() - data_start
-    } else {
-        plan.map(|(_, t)| t).unwrap_or(1)
-    }
-    .max(1);
+    //
+    // A clip short enough to finish inside the prebuffer floor never reached
+    // the projection, so it has no plan - but it is also necessarily complete,
+    // so the `eof` arm covers it.
+    let total_pcm = if eof { clip.len() } else { plan.unwrap_or(1) }.max(1);
 
     // A tap that arrived while the clip was buffering is a request to skip, not
     // a barge-in on audio that hasn't started yet - but treat it the same way:
     // the user wants this reply to stop.
     if TOUCH_EVENTS.try_receive().is_ok() {
-        return true;
+        return SpeakOutcome::Interrupted;
     }
 
     // Show the sentence only now, not before the request. Buffering takes about
@@ -2433,7 +2848,22 @@ where
             .await
             {
                 Ok(Ok(0)) => eof.set(true),
-                Ok(Ok(n)) => clip.borrow_mut().extend_from_slice(&chunk[..n]),
+                Ok(Ok(n)) => {
+                    mp3.feed(&chunk[..n]);
+                    // One frame, then back to the executor. See
+                    // `Mp3Stream::decode_frame`: decoding a whole read in one
+                    // stretch can straddle a DMA completion, and a TX FIFO that
+                    // nothing refills holds its last sample as a buzz. Written
+                    // as separate statements so the `RefMut` is dropped at the
+                    // semicolon rather than being held across the yield.
+                    loop {
+                        let progressed = mp3.decode_frame(&mut clip.borrow_mut(), false);
+                        if !progressed {
+                            break;
+                        }
+                        embassy_futures::yield_now().await;
+                    }
+                }
                 Ok(Err(e)) => {
                     println!("TTS body read error: {e:?}");
                     eof.set(true);
@@ -2444,12 +2874,25 @@ where
                 }
             }
         }
+        // Body over, however it ended: release the watermark and decode the
+        // quarter-second the reservoir has been holding back. Still one frame
+        // per poll - the speaker is mid-sentence at this point, and this is the
+        // tail it is about to reach.
+        loop {
+            let progressed = mp3.decode_frame(&mut clip.borrow_mut(), true);
+            if !progressed {
+                break;
+            }
+            embassy_futures::yield_now().await;
+        }
         core::future::pending::<()>().await
     };
 
     let play = async {
         let mut seg = 0usize;
-        let mut pos = data_start;
+        // Decoded PCM starts at byte zero: unlike the wav the server used to
+        // send, there is no header to skip past.
+        let mut pos = 0usize;
         let mut interrupted = false;
         // Blocks the download was behind on. Should be zero now that the start
         // is gated on the projection; a nonzero count means the server's rate
@@ -2518,7 +2961,12 @@ where
             // Which sentence the voice is on, by fraction of the clip played.
             // Approximate - it assumes an even speaking rate across the clip -
             // but there is no gap in the audio for the drift to show up in.
-            let spoken = (((pos - data_start) * total_len) / total_pcm).min(total_len);
+            //
+            // In u64: `usize` is 32 bits here, and a megabyte of PCM times a
+            // four-figure character count is past 2^32.
+            let spoken =
+                ((pos as u64 * total_len as u64) / total_pcm as u64) as usize;
+            let spoken = spoken.min(total_len);
             while seg + 1 < segments.len() && spoken >= bounds[seg] {
                 seg += 1;
             }
@@ -2614,21 +3062,33 @@ where
     // handshake and is the one phase that can't be animated through - it is
     // CPU-bound, so the executor never gets to run the redraw.
     println!(
-        "TTS timings: connect {t_connect}ms, send {}ms, prebuffer {}ms, first sample {t_first_sample}ms, total {}ms, {} bytes",
+        "TTS timings: connect {t_connect}ms, send {}ms, prebuffer {}ms, first sample {t_first_sample}ms, total {}ms, {} bytes mp3 -> {} bytes pcm",
         t_send - t_connect,
         t_prebuffer - t_send,
         t0.elapsed().as_millis(),
+        mp3.compressed,
         clip.len(),
     );
     // The two numbers that decide whether this is fixed. `overrun` is FIFO
-    // drain time, audible as clicks and held tones; `delivery` against the
-    // 48,000 B/s drain says whether the server could have kept up at all, and
-    // so whether the projection was right to make the user wait.
+    // drain time, audible as clicks and held tones; `delivery` against what
+    // realtime costs says whether the server could have kept up at all, and so
+    // whether the projection was right to make the user wait.
+    //
+    // Both rates are compressed bytes off the socket, so the threshold they are
+    // judged against moves with them: 48,000 B/s of PCM divided by the clip's
+    // own expansion ratio, which lands near 7,900 on this endpoint. The gap
+    // between `delivery` and `needed` is the whole point of the mp3 switch - as
+    // wav they were 30-45,000 against 48,000, i.e. losing on every clip.
+    let realtime_raw = if clip.is_empty() {
+        AUDIO_SAMPLE_RATE as u64 * 2
+    } else {
+        AUDIO_SAMPLE_RATE as u64 * 2 * mp3.compressed as u64 / clip.len() as u64
+    };
     println!(
-        "TTS audio: {blocks} blocks, {starved} starved, overrun total {overrun_total}ms / max {overrun_max}ms, prebuffer {} B/s, delivery {} B/s vs {} B/s drain",
-        if t_prebuffer > t_send { clip.len().min(TTS_PREBUFFER_BYTES) as u64 * 1000 / (t_prebuffer - t_send) } else { 0 },
-        if t0.elapsed().as_millis() > t_send { clip.len() as u64 * 1000 / (t0.elapsed().as_millis() - t_send) } else { 0 },
-        AUDIO_SAMPLE_RATE as u64 * 2,
+        "TTS audio: {blocks} blocks, {starved} starved, overrun total {overrun_total}ms / max {overrun_max}ms, prebuffer {} B/s, delivery {} B/s vs {} B/s needed",
+        if t_prebuffer > t_send { raw_at_prebuffer as u64 * 1000 / (t_prebuffer - t_send) } else { 0 },
+        if t0.elapsed().as_millis() > t_send { mp3.compressed as u64 * 1000 / (t0.elapsed().as_millis() - t_send) } else { 0 },
+        realtime_raw,
     );
     // Dead air between DMA transfers, and how hard the clip is driving the DAC.
     // `gap` is the FIFO-drain window the overrun figure can't see; `peak` at or
@@ -2651,7 +3111,7 @@ where
     let mut at_edge = 0usize;
     let mut prev = 0i32;
     let samples_per_block = (tx_buffer.len() & !3) / 2;
-    for (i, s) in clip[data_start..].chunks_exact(2).enumerate() {
+    for (i, s) in clip.chunks_exact(2).enumerate() {
         let v = i16::from_le_bytes([s[0], s[1]]) as i32;
         peak = peak.max(v.abs());
         clipped += usize::from(v.abs() >= 32_700);
@@ -2678,11 +3138,28 @@ where
     println!(
         "TTS pcm: max step {max_step}, {steps_4k} steps >4k, {steps_12k} >12k, {at_edge} of those on a block edge"
     );
-    match wav::parse_fmt(&clip) {
-        Some((fmt, ch, rate, bits)) => println!(
-            "TTS wav fmt: tag {fmt}, {ch} ch, {rate} Hz, {bits}-bit (device expects tag 1, 1 ch, {AUDIO_SAMPLE_RATE} Hz, 16-bit)"
-        ),
-        None => println!("TTS wav fmt: no fmt chunk found"),
+    // What the encoder actually sent, reported once per clip. The rate is the
+    // one that matters: nothing in this path resamples, so a server that
+    // switched to 16kHz or 48kHz would not error anywhere - it would just speak
+    // at the wrong speed, and this line is the only place that would say so.
+    // `expansion` is the ratio the projection above is built on, x10 because
+    // there is no float formatting here worth the code size.
+    match mp3.format {
+        Some((rate, channels)) => {
+            println!(
+                "TTS mp3: {} frames, {} ch, {rate} Hz, expansion {}.{}x (device expects 1 ch, {AUDIO_SAMPLE_RATE} Hz)",
+                mp3.frames,
+                channels,
+                clip.len() * 10 / mp3.compressed.max(1) / 10,
+                clip.len() * 10 / mp3.compressed.max(1) % 10,
+            );
+            if rate != AUDIO_SAMPLE_RATE || channels != 1 {
+                println!(
+                    "TTS mp3: WRONG FORMAT - playback will be the wrong speed; the endpoint changed its encoder"
+                );
+            }
+        }
+        None => println!("TTS mp3: no frame decoded from {} bytes", mp3.compressed),
     }
     // I2S_TX_STOP_EN is deliberately cleared (BCLK/WS have to keep running for
     // the mic), which means the TX unit repeats its last sample forever once
@@ -2694,7 +3171,7 @@ where
     pa_enable.set_low();
     // Back to the thinking colour between sentences.
     set_led(led, &UiState::Thinking { tool: None });
-    interrupted
+    if interrupted { SpeakOutcome::Interrupted } else { SpeakOutcome::Done }
 }
 
 /// Mean absolute amplitude of a little-endian i16 PCM buffer, used as a cheap
@@ -2872,6 +3349,173 @@ async fn button_task(mut button: Input<'static>) {
         NEW_CONVERSATION.signal(());
         button.wait_for_rising_edge().await;
         Timer::after(Duration::from_millis(BUTTON_DEBOUNCE_MS)).await;
+    }
+}
+
+/// How often the battery is sampled.
+///
+/// A LiPo this size moves on a scale of minutes, so this is about how quickly
+/// the reading settles after boot rather than how fast the charge changes.
+const BATTERY_SAMPLE_MS: u64 = 2_000;
+/// Readings averaged per report. The ADC is noisy at the LSB level and a
+/// single conversion wanders by tens of millivolts; the factory firmware
+/// averaged too (`ADC value: %d average: %ld level: %ld`).
+const BATTERY_OVERSAMPLE: u32 = 16;
+/// Ratio between the cell and what the ADC pin sees.
+///
+/// **Measured, not assumed.** The probe pass read a rock-steady 2079-2084mV at
+/// the pin on a USB-charged device; doubled that is ~4166mV, which is a full
+/// LiPo to within the ADC's own accuracy. Any other plausible ratio puts the
+/// cell somewhere it physically cannot be. The tight spread (5-9mV over 16
+/// samples) is also what proved GPIO1 is connected to a real divider rather
+/// than floating.
+const BATTERY_DIVIDER: u32 = 2;
+
+/// Weight of the previous average when a new sample lands, out of
+/// `BATTERY_SMOOTH_DEN`.
+///
+/// The reading is already stable at rest, so this is not about noise - it is
+/// about the sag when the speaker and the WiFi radio both draw at once. Without
+/// it the badge would drop several percent mid-reply and climb back afterwards,
+/// which reads as a failing battery rather than a busy one.
+const BATTERY_SMOOTH_NUM: u32 = 3;
+const BATTERY_SMOOTH_DEN: u32 = 4;
+
+/// Last published cell voltage in millivolts, or 0 before the first average.
+///
+/// A plain atomic rather than a `Signal`: the reading has no events to deliver
+/// and no consumer that must not miss one. The idle card asks for whatever the
+/// current value is at the moment it redraws, and a battery that changed while
+/// nobody was looking is not news.
+static BATTERY_MV: AtomicU32 = AtomicU32::new(0);
+static BATTERY_CHARGING: AtomicBool = AtomicBool::new(false);
+
+/// Cell voltage to state of charge, as a resting-discharge curve.
+///
+/// A LiPo is not linear in voltage: it spends most of its life between 3.9 and
+/// 3.7V and falls off a cliff at both ends, so straight-line interpolation from
+/// 3.0-4.2V would sit at "half" for hours and then empty in minutes. These are
+/// the standard curve's knees, interpolated linearly between.
+///
+/// Two honest caveats. Under load the cell sags, so a reading taken mid-reply
+/// understates the charge - that is what `BATTERY_SMOOTH_NUM` is damping. And
+/// while charging the voltage is held up by the charger, so the percentage
+/// reads high and will settle down after unplugging.
+const BATTERY_CURVE: [(u32, u8); 12] = [
+    (3000, 0),
+    (3300, 5),
+    (3600, 10),
+    (3700, 20),
+    (3750, 30),
+    (3790, 40),
+    (3830, 50),
+    (3870, 60),
+    (3920, 70),
+    (3990, 80),
+    (4080, 90),
+    (4200, 100),
+];
+
+fn battery_percent(mv: u32) -> u8 {
+    let first = BATTERY_CURVE[0];
+    let last = BATTERY_CURVE[BATTERY_CURVE.len() - 1];
+    if mv <= first.0 {
+        return first.1;
+    }
+    if mv >= last.0 {
+        return last.1;
+    }
+    for pair in BATTERY_CURVE.windows(2) {
+        let (lo_mv, lo_pct) = pair[0];
+        let (hi_mv, hi_pct) = pair[1];
+        if mv < hi_mv {
+            let span = hi_mv - lo_mv;
+            let step = (hi_pct - lo_pct) as u32;
+            return (lo_pct as u32 + (mv - lo_mv) * step / span) as u8;
+        }
+    }
+    last.1
+}
+
+/// The current gauge reading, or `None` before the sampler's first average.
+fn battery_reading() -> Option<ui::Battery> {
+    let mv = BATTERY_MV.load(Ordering::Relaxed);
+    if mv == 0 {
+        return None;
+    }
+    Some(ui::Battery {
+        percent: battery_percent(mv),
+        charging: BATTERY_CHARGING.load(Ordering::Relaxed),
+    })
+}
+
+/// Samples the battery divider on GPIO1 and publishes a smoothed cell voltage
+/// and the charge-status pin for the idle card to read.
+///
+/// One thing here is still an assumption. **`BATTERY_CHARGING`'s polarity**:
+/// the pin is configured with a pull-up on the theory that it is an open-drain
+/// `/CHG` output, i.e. pulled low by the charger IC while charging and released
+/// afterwards. On USB with a full cell it reads HIGH, which is consistent with
+/// that - but so is "the pin does nothing at all". Confirming it needs a
+/// partly-flat cell on the charger, and until that happens the bolt on the
+/// badge may simply never appear. If it turns out inverted, flip the
+/// `is_low()` below and nothing else changes.
+#[embassy_executor::task]
+async fn battery_probe_task(
+    mut adc: Adc<'static, esp_hal::peripherals::ADC1<'static>, esp_hal::Blocking>,
+    mut pin: esp_hal::analog::adc::AdcPin<
+        esp_hal::peripherals::GPIO1<'static>,
+        esp_hal::peripherals::ADC1<'static>,
+        AdcCalCurve<esp_hal::peripherals::ADC1<'static>>,
+    >,
+    charging: Input<'static>,
+) {
+    loop {
+        // With a calibration scheme attached, `read_blocking` returns
+        // millivolts at the pin, not a raw code - esp-hal runs the efuse curve
+        // over the converter output before handing it back. So there is one
+        // number here, and it is already the useful one.
+        //
+        // Oversampled in u32: 16 readings that cannot exceed the ~3100mV of
+        // 11dB range sum to well under 16 bits, so this can't overflow. Spread
+        // over the sample window rather than taken back to back, so the
+        // average covers real noise instead of one instant of it.
+        let mut mv_sum: u32 = 0;
+        let mut mv_min = u16::MAX;
+        let mut mv_max = 0u16;
+        for _ in 0..BATTERY_OVERSAMPLE {
+            // A single conversion is a few microseconds. It is the only
+            // synchronous call in this task, and it is short enough not to
+            // matter to the DMA deadlines that dominate the audio path.
+            let mv = adc.read_blocking(&mut pin);
+            mv_sum += mv as u32;
+            mv_min = mv_min.min(mv);
+            mv_max = mv_max.max(mv);
+            Timer::after(Duration::from_millis(2)).await;
+        }
+        let cell = (mv_sum / BATTERY_OVERSAMPLE) as u32 * BATTERY_DIVIDER;
+
+        // The first average is adopted whole. Seeding the filter from zero
+        // would walk the badge up from empty over the first half-minute, which
+        // looks exactly like a device about to die.
+        let previous = BATTERY_MV.load(Ordering::Relaxed);
+        let smoothed = if previous == 0 {
+            cell
+        } else {
+            (previous * BATTERY_SMOOTH_NUM + cell) / BATTERY_SMOOTH_DEN
+        };
+        BATTERY_MV.store(smoothed, Ordering::Relaxed);
+        BATTERY_CHARGING.store(charging.is_low(), Ordering::Relaxed);
+
+        // `spread` is the tell for a floating pin: a real divider sits within a
+        // few millivolts across 16 samples, an unconnected one wanders wildly.
+        println!(
+            "battery: cell {cell} mV (spread {}), smoothed {smoothed} mV = {}%, charge pin {}",
+            (mv_max - mv_min) as u32 * BATTERY_DIVIDER,
+            battery_percent(smoothed),
+            if charging.is_low() { "LOW" } else { "HIGH" },
+        );
+        Timer::after(Duration::from_millis(BATTERY_SAMPLE_MS)).await;
     }
 }
 

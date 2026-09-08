@@ -4,6 +4,18 @@ runner = "espflash flash --monitor --chip esp32s3"
 [env]
 ESP_LOG="info"
 
+# For the one C dependency in the tree: minimp3, built by `vendor/rmp3`'s
+# build script through the `cc` crate. Left to itself `cc` picks the toolchain's
+# generic `xtensa-esp-elf-gcc`, whose default configuration is *big* endian, and
+# the object it produces fails the link with "compiled for a big endian system
+# and target is little endian". `xtensa-esp32s3-elf-gcc` is the same compiler
+# with this chip's core configuration selected, which is what rustc already uses
+# for the link step. `-mlongcalls` matches what every Espressif C build uses:
+# it lets the linker relax calls that end up out of the direct-call range once
+# the code is placed in flash.
+CC_xtensa_esp32s3_none_elf = "xtensa-esp32s3-elf-gcc"
+CFLAGS_xtensa_esp32s3_none_elf = "-mlongcalls"
+
 [build]
 rustflags = [
   "-C", "link-arg=-nostartfiles",

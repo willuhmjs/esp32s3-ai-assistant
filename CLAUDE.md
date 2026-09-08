@@ -9,9 +9,11 @@ the device itself. Development targets a self-hosted agent (Hermes) and
 self-hosted Speaches for STT/TTS, but the firmware knows nothing about either
 beyond the standard OpenAI paths.
 
-The repo lives at `~/custom-os`; the crate, the binary and the GitHub repo are
-all `esp32s3-voice-assistant`. Only the working directory still carries the old
-`custom-os` name.
+Three names, deliberately, so don't "fix" any of them to match the others: the
+working directory is `~/custom-os` (the original name), the crate and binary
+are `esp32s3-voice-assistant` (so the built artifact is
+`target/xtensa-esp32s3-none-elf/release/esp32s3-voice-assistant`), and the
+GitHub remote is `esp32s3-ai-assistant`.
 
 **Board compatibility.** The firmware is written against ESP32-S3 boards
 pairing a GC9A01 240x240 round LCD, a CST816x touch controller and an ES8311
@@ -41,6 +43,8 @@ github.com/78/xiaozhi-esp32) — treat those pin numbers as ground truth.
 - Audio codec: ES8311 (single chip, both mic ADC and speaker DAC), I2C0 for
   control registers, I2S0 for audio data (full duplex, MCLK/BCLK/WS shared)
 - Status LED: WS2812 (addressable RGB) on GPIO48, driven via RMT
+- Battery: LiPo (nominally 3.7V 400mAh) behind a 2:1 divider into GPIO1 =
+  ADC1_CH0, charge status on GPIO41 — see "Battery gauge"
 - 16MB flash, 8MB octal PSRAM
 - Board's original firmware is fully backed up at
   `~/esp32s3-backup/full_flash_backup_16MB.bin` — restore with:
@@ -194,6 +198,40 @@ it is not for DMA: embassy-net only touches them with CPU loads/stores, and
 the one window where PSRAM is unreachable (esp-storage's cache-off flash
 write) runs inside a critical section.
 
+## Battery gauge
+
+`battery_probe_task` in `main.rs` samples GPIO1 every 2s (16 oversampled
+conversions, ~2ms apart) and publishes a smoothed cell voltage into
+`BATTERY_MV` / `BATTERY_CHARGING` atomics. The idle card reads them at redraw
+time via `battery_reading()` — a pull, not a push, because `UiState::Idle` can
+sit on screen for 20s and it is the only place the gauge appears.
+
+- **ADC1, not ADC2, and that is load-bearing.** ADC2 on the ESP32-S3 is shared
+  with the WiFi radio and cannot be read while the radio is up — which is the
+  state this device is in essentially always. GPIO1 being ADC1_CH0 is what
+  makes battery sensing possible at all here.
+- `Attenuation::_11dB` (~3.1V full scale) because 4.2V through the divider is
+  2.1V; every lower setting clips. `AdcCalCurve` applies the chip's own efuse
+  calibration, so `read_blocking` returns **millivolts at the pin**, not a raw
+  code — there is no second raw number to read.
+- **The 2:1 divider is measured, not assumed.** The probe pass read a steady
+  2079–2084mV at the pin (spread 5–9mV over 16 samples) on a charged device;
+  doubled, that is a full LiPo. The tight spread is also what proves GPIO1 is
+  on a real divider rather than floating — a floating pin wanders.
+- `BATTERY_CURVE` is a resting LiPo discharge curve with linear interpolation
+  between knees, *not* a straight line from 3.0 to 4.2V: the cell spends most
+  of its life between 3.7 and 3.9V, so a linear map would sit at "half" for
+  hours and then empty in minutes. Under load the cell sags and the reading
+  understates; while charging the charger holds it up and it overstates. The
+  3:4 EMA (`BATTERY_SMOOTH_NUM/DEN`) exists to damp the sag when the speaker
+  and radio draw together, not to fight ADC noise.
+- **Still unconfirmed: `BATTERY_CHARGING` (GPIO41) polarity.** Wired as an
+  input with a pull-up on the theory that it is an open-drain `/CHG` output
+  (low while charging). It reads HIGH on USB with a full cell, which is
+  consistent with that — and equally consistent with the pin doing nothing.
+  Confirming it needs a partly-flat cell on the charger. If it proves
+  inverted, flip the single `charging.is_low()` in the task.
+
 ## Audio
 
 - **Full duplex on one codec.** Only GPIO9/GPIO45 carry BCLK/WS and the GPIO
@@ -320,7 +358,19 @@ settings), a tap landing on the Wi-Fi Setup row, the radio switching to
 `voice-assistant-setup`, cancel-and-reboot, and swipe-to-cancel during Listening
 (`listening loop exited: cancelled` in the serial log).
 
+Also verified: **battery sensing** — GPIO1 reads a stable, correctly-scaled
+cell voltage and the task publishes it (`battery: cell 4182 mV (spread 8),
+smoothed 4181 mV = 98%, charge pin HIGH` in the serial log).
+
 **Not yet verified on hardware** (written, compiles clean):
+- The battery badge on the idle card, and whether the charge bolt ever appears
+  (see "Battery gauge" — the pin's polarity is still an assumption).
+- The wifi dot. It was at `(W - 16, 16)` = r=147 on a panel whose glass stops
+  at r=116, so it had **never** been drawn on real pixels despite being in the
+  framebuffer every idle frame. Moved to `(156, 36)` alongside the battery
+  badge; `BADGE_Y` in `ui.rs` documents the constraint. Worth remembering as a
+  class of bug: on this display, "it's in the framebuffer" is not "it's on
+  screen", and anything past r≈108 will at best clash with the ring.
 - Touch-coordinate-to-display-coordinate mapping for menu hit-testing, and
   swipe polarity. This is the thing most likely to need physical iteration.
 - The volume stepper, erase-and-reboot.

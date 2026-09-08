@@ -1,4 +1,9 @@
-// Minimal WAV (RIFF/PCM) helpers for 16-bit mono audio.
+// Minimal WAV (RIFF/PCM) writer for 16-bit mono audio.
+//
+// Write-only: the recorder wraps its PCM in a header for the STT upload, and
+// that is the only WAV this firmware handles. The reader half - `parse_fmt`,
+// `data_chunk_len`, `find_data_chunk` - was deleted when `speak()` moved to
+// mp3 (see `TTS_RESPONSE_FORMAT`), which left it with no callers.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -32,82 +37,4 @@ pub fn wav_bytes(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     out.extend_from_slice(&header);
     out.extend_from_slice(pcm);
     out
-}
-
-/// The `fmt ` chunk's contents: (format tag, channels, sample rate, bits per
-/// sample). Format tag 1 is integer PCM; 3 is IEEE float, which this firmware
-/// cannot play.
-///
-/// Nothing depends on this - it exists so the log can say what the server
-/// actually sent, rather than the firmware assuming 24kHz mono 16-bit and
-/// producing distortion if that assumption is ever wrong.
-pub fn parse_fmt(wav: &[u8]) -> Option<(u16, u16, u32, u16)> {
-    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut pos = 12;
-    while pos + 8 <= wav.len() {
-        let chunk_id = &wav[pos..pos + 4];
-        let chunk_len =
-            u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]) as usize;
-        if chunk_id == b"fmt " && pos + 8 + 16 <= wav.len() {
-            let b = &wav[pos + 8..];
-            return Some((
-                u16::from_le_bytes([b[0], b[1]]),
-                u16::from_le_bytes([b[2], b[3]]),
-                u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-                u16::from_le_bytes([b[14], b[15]]),
-            ));
-        }
-        pos += 8 + chunk_len + (chunk_len % 2);
-    }
-    None
-}
-
-/// The `data` chunk's declared payload length, if the header states a
-/// believable one.
-///
-/// A server that streams its WAV out as it synthesises doesn't know the length
-/// when it writes the header, and writes a placeholder instead - 0, or
-/// 0xFFFFFFFF, or the maximum RIFF size. Those are rejected here so the caller
-/// can fall back to Content-Length rather than trusting a made-up number.
-pub fn data_chunk_len(wav: &[u8]) -> Option<usize> {
-    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut pos = 12;
-    while pos + 8 <= wav.len() {
-        let chunk_id = &wav[pos..pos + 4];
-        let chunk_len =
-            u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]);
-        if chunk_id == b"data" {
-            // 100 MB of 24kHz mono is half an hour of speech; anything at or
-            // past that is a placeholder, not a length.
-            if chunk_len == 0 || chunk_len as usize > 100 * 1024 * 1024 {
-                return None;
-            }
-            return Some(chunk_len as usize);
-        }
-        pos += 8 + chunk_len as usize + (chunk_len as usize % 2);
-    }
-    None
-}
-
-/// Finds the start of the `data` chunk's payload in a WAV file, skipping
-/// past any header/other chunks. Returns the offset, or 0 if not found
-/// (caller can fall back to skipping the standard 44-byte header).
-pub fn find_data_chunk(wav: &[u8]) -> usize {
-    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
-        return 44.min(wav.len());
-    }
-    let mut pos = 12;
-    while pos + 8 <= wav.len() {
-        let chunk_id = &wav[pos..pos + 4];
-        let chunk_len = u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]) as usize;
-        if chunk_id == b"data" {
-            return pos + 8;
-        }
-        pos += 8 + chunk_len + (chunk_len % 2);
-    }
-    44.min(wav.len())
 }

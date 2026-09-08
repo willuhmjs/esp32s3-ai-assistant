@@ -1,0 +1,29 @@
+# Vendored from crates.io rmp3 0.3.1 (CC0-1.0, github.com/notviri/rmp3), which
+# bundles minimp3 (CC0-1.0, github.com/lieff/minimp3). See ../README.md for the
+# one substantive change: `libc::{c_int, c_uchar}` -> `core::ffi::{...}`, and
+# the `libc` dependency dropped as a result.
+
+[package]
+edition = "2018"
+name = "rmp3"
+version = "0.3.1"
+authors = ["viri <git@stuff.moe>"]
+include = ["ffi/minimp3/minimp3.h", "ffi/minimp3.c", "**/*.rs", "Cargo.toml", "LICENSE"]
+description = "fast & safe no_std minimp3 wrapper"
+homepage = "https://github.com/notviri/rmp3"
+documentation = "https://docs.rs/rmp3"
+readme = "README.md"
+license = "CC0-1.0"
+repository = "https://github.com/notviri/rmp3"
+[package.metadata.docs.rs]
+features = ["nightly-docs", "std"]
+[build-dependencies.cc]
+version = "1.0"
+
+[features]
+default = ["simd"]
+float = []
+mp1-mp2 = []
+nightly-docs = []
+simd = []
+std = []

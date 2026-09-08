@@ -14,7 +14,7 @@ use embedded_graphics::{
     prelude::*,
     primitives::{
         Arc, Circle, CornerRadii, Line, Primitive, PrimitiveStyle, PrimitiveStyleBuilder,
-        Rectangle, RoundedRectangle,
+        Rectangle, RoundedRectangle, Triangle,
     },
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
@@ -41,15 +41,25 @@ const ROW_BG: Rgb565 = Rgb565::new(3, 6, 5);
 // Shared with the touch hit-testing in main.rs so the drawn rows and the
 // tappable rows can never drift apart.
 
-/// Left/right edge of a menu row. Chosen so the row corners stay inside the
-/// inscribed circle even for the lowest row (r=112.4 at the worst corner).
-pub const MENU_X0: i32 = 32;
-pub const MENU_X1: i32 = 208;
+/// Left/right edge of a menu row.
+///
+/// These used to be 32/208, which fit inside the bezel but ran the rows almost
+/// the full width of the panel - on a round display that reads as a list that
+/// has outgrown its screen rather than as buttons. 152px leaves a visible gutter
+/// following the curve on both sides, and still clears the longest label
+/// ("Erase Settings", 126px in FONT_9X15_BOLD) by 13px each side.
+///
+/// The binding constraint is the lowest row's outer corners: at (196, 190) that
+/// is r=103 from center, comfortably inside the r=116 inscribed circle.
+pub const MENU_X0: i32 = 44;
+pub const MENU_X1: i32 = 196;
 pub const MENU_ROW_H: i32 = 40;
 const MENU_ROW_GAP: i32 = 6;
 const MENU_TOP: i32 = 58;
-/// Width of the -/+ tap zones at each end of a row that has a value.
-pub const MENU_STEP_ZONE: i32 = 46;
+/// Width of the -/+ tap zones at each end of a row that has a value. Narrowed
+/// alongside the rows so the stepper's body zone keeps enough room for the
+/// label above the value (36px) rather than being squeezed out by the end zones.
+pub const MENU_STEP_ZONE: i32 = 42;
 
 /// Top edge (y) of menu row `i`.
 pub const fn menu_row_top(i: usize) -> i32 {
@@ -142,6 +152,10 @@ pub enum UiState {
         /// Completed back-and-forth pairs still in the context sent to the
         /// model. Zero means a fresh conversation and draws nothing at all.
         exchanges: usize,
+        /// `None` until the sampler has published its first average, which is
+        /// about two seconds after boot. Drawing nothing is better than
+        /// flashing an 0% badge that immediately jumps to full.
+        battery: Option<Battery>,
     },
     /// `level` is 0..=10, derived from the live mic RMS so the ring reacts to
     /// the user's actual voice instead of a free-running animation.
@@ -338,28 +352,198 @@ fn wrapped_text(
     }
 }
 
-/// Simple mic glyph: a rounded body + a small stand, built from primitives.
+/// Mic glyph: a capsule body cradled in a U-shaped yoke, on a stand.
+///
+/// The shape is doing real work here - it is the only thing on the Idle card
+/// telling a stranger what the device is for.
+///
+/// **Every part of it is a filled shape, and that is the whole trick.**
+/// embedded-graphics does no antialiasing, so a thin stroke following a curve
+/// is drawn as a chain of single-pixel steps: a stroked `Arc` at this size
+/// comes out visibly lumpy, with the step pattern changing as the curve turns,
+/// and it reads as a broken wire rather than a yoke. Filled areas have no thin
+/// curve to alias - only their outer boundary is stepped, and at these radii
+/// that boundary looks smooth. So the yoke is built by subtraction instead: a
+/// disc, a smaller disc punched out of it in `BG`, then the top half cut away,
+/// leaving a clean band of exactly even thickness. `render` clears the whole
+/// framebuffer to `BG` before dispatching here, and nothing else is drawn
+/// within 55px of center on either card that uses this, so punching with `BG`
+/// is safe.
+///
+/// It is also drawn about a third larger than the first version. Curves get
+/// smoother the more pixels they span, and the Idle card had the room going
+/// spare.
+///
+/// Order matters: the yoke's cuts would erase the body, so the body goes on
+/// last. Furthest corner is 39px from center, inside the radius-55 floor of
+/// the Listening level ring.
 fn draw_mic(fbuf: &mut RawFrameBuf<Rgb565, &mut [u8]>, color: Rgb565) {
-    Circle::with_center(Point::new(W / 2, H / 2 - 14), 16)
-        .into_styled(PrimitiveStyle::with_stroke(color, 3))
+    let yoke = Point::new(W / 2, H / 2 - 14);
+    const YOKE_OUTER: u32 = 54;
+    const YOKE_INNER: u32 = 44;
+    // Weight shared by the yoke band, the stand and the base, so the whole
+    // glyph reads as one stroke thickness.
+    const STROKE: i32 = (YOKE_OUTER as i32 - YOKE_INNER as i32) / 2;
+
+    let outer = Circle::with_center(yoke, YOKE_OUTER);
+    outer
+        .into_styled(PrimitiveStyle::with_fill(color))
         .draw(fbuf)
         .ok();
-    Line::new(Point::new(W / 2, H / 2 + 2), Point::new(W / 2, H / 2 + 16))
-        .into_styled(PrimitiveStyle::with_stroke(color, 3))
+    Circle::with_center(yoke, YOKE_INNER)
+        .into_styled(PrimitiveStyle::with_fill(BG))
         .draw(fbuf)
         .ok();
-    Line::new(Point::new(W / 2 - 10, H / 2 + 16), Point::new(W / 2 + 10, H / 2 + 16))
-        .into_styled(PrimitiveStyle::with_stroke(color, 3))
+    // Cut the top half off the ring, turning it into a U.
+    //
+    // The cut is taken from the circle's own `bounding_box`, never recomputed
+    // from `yoke` and `YOKE_OUTER`. An even diameter cannot be centred on a
+    // pixel, so `with_center` biases the disc right and down by one: d=54 spans
+    // `yoke.x - 26 ..= yoke.x + 27`, not `-27 ..= +26`. A rectangle derived the
+    // obvious way misses the disc's rightmost column, and the surviving pixels
+    // of that column show up as a stray nub on the right arm of the yoke.
+    let bb = outer.bounding_box();
+    Rectangle::new(bb.top_left, Size::new(bb.size.width, bb.size.height / 2))
+        .into_styled(PrimitiveStyle::with_fill(BG))
+        .draw(fbuf)
+        .ok();
+
+    // Stand, starting high enough to overlap the solid part of the yoke rather
+    // than merely touching it - a one-pixel seam here is very visible.
+    let yoke_bottom = yoke.y + YOKE_INNER as i32 / 2;
+    let base_y = yoke.y + 42;
+    Rectangle::new(
+        Point::new(W / 2 - STROKE / 2, yoke_bottom),
+        Size::new(STROKE as u32, (base_y - yoke_bottom) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(color))
+    .draw(fbuf)
+    .ok();
+    Rectangle::new(Point::new(W / 2 - 16, base_y), Size::new(33, STROKE as u32))
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(fbuf)
+        .ok();
+
+    // Capsule body last, over the yoke's cuts. A corner radius of half the
+    // width is what makes it a capsule rather than a rounded box.
+    RoundedRectangle::new(
+        Rectangle::with_center(Point::new(W / 2, H / 2 - 18), Size::new(22, 38)),
+        CornerRadii::new(Size::new(11, 11)),
+    )
+    .into_styled(PrimitiveStyle::with_fill(color))
+    .draw(fbuf)
+    .ok();
+}
+
+/// What the battery gauge shows. `percent` is already mapped off the cell
+/// voltage by the caller - the UI does not know about millivolts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Battery {
+    pub percent: u8,
+    pub charging: bool,
+}
+
+/// Vertical centre of the two status badges either side of the page dots.
+///
+/// Not the top edge of the panel, and that matters here: the wifi dot used to
+/// live at `(W - 16, 16)`, which is 147px from centre on a panel whose glass
+/// stops at 116. It was drawn into the framebuffer on every idle frame and
+/// clipped away by the bezel every time - the indicator has never actually been
+/// visible. Everything on this row sits inside r=108, clear of the ring's inner
+/// edge at r=111.
+const BADGE_Y: i32 = 36;
+/// Left edge of the battery body. Its full extent including the nub is 73..94,
+/// centred on 83.5, which the wifi dot at x=156 mirrors about the vertical axis.
+const BATT_X: i32 = 73;
+const WIFI_DOT_X: i32 = 156;
+
+fn draw_wifi_dot(fbuf: &mut RawFrameBuf<Rgb565, &mut [u8]>, ok: bool) {
+    let color = if ok { GREEN } else { RED };
+    Circle::with_center(Point::new(WIFI_DOT_X, BADGE_Y), 5)
+        .into_styled(PrimitiveStyle::with_fill(color))
         .draw(fbuf)
         .ok();
 }
 
-fn draw_wifi_dot(fbuf: &mut RawFrameBuf<Rgb565, &mut [u8]>, ok: bool) {
-    let color = if ok { GREEN } else { RED };
-    Circle::with_center(Point::new(W - 16, 16), 5)
+/// Battery badge: a 20x11 pill with a fill bar, a nub, and the percentage
+/// underneath.
+///
+/// The number is there because the glyph alone can't distinguish "half" from
+/// "just under half" at 16 pixels of bar, and this is a device you carry
+/// around - the difference between 45% and 15% is the whole reason to look.
+///
+/// Colour is a plain three-band split rather than a gradient: green down to
+/// 50%, amber down to 20%, red below. While charging it stays green whatever
+/// the level, since the level is on its way up.
+fn draw_battery(fbuf: &mut RawFrameBuf<Rgb565, &mut [u8]>, batt: Battery) {
+    let pct = batt.percent.min(100) as i32;
+    let color = if batt.charging {
+        GREEN
+    } else if pct >= 50 {
+        GREEN
+    } else if pct >= 20 {
+        AMBER
+    } else {
+        RED
+    };
+
+    // Body outline and the nub on the positive end.
+    Rectangle::new(Point::new(BATT_X, BADGE_Y - 5), Size::new(20, 11))
+        .into_styled(PrimitiveStyle::with_stroke(color, 1))
+        .draw(fbuf)
+        .ok();
+    Rectangle::new(Point::new(BATT_X + 20, BADGE_Y - 2), Size::new(2, 5))
         .into_styled(PrimitiveStyle::with_fill(color))
         .draw(fbuf)
         .ok();
+
+    // Fill bar in the 16x7 interior. A cell that is nearly flat but not dead
+    // still gets one column, so "almost empty" and "gauge not reading" don't
+    // look the same.
+    let fill = (16 * pct / 100).clamp(if pct > 0 { 1 } else { 0 }, 16);
+    if fill > 0 {
+        Rectangle::new(Point::new(BATT_X + 2, BADGE_Y - 3), Size::new(fill as u32, 7))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(fbuf)
+            .ok();
+    }
+
+    // Charging bolt, drawn over the fill in white so it reads at any level.
+    // Two triangles is all there is room for at 7px tall, but the silhouette is
+    // recognisable enough to mean "plugged in".
+    if batt.charging {
+        let bolt = PrimitiveStyle::with_fill(WHITE);
+        Triangle::new(
+            Point::new(BATT_X + 12, BADGE_Y - 3),
+            Point::new(BATT_X + 7, BADGE_Y + 1),
+            Point::new(BATT_X + 11, BADGE_Y + 1),
+        )
+        .into_styled(bolt)
+        .draw(fbuf)
+        .ok();
+        Triangle::new(
+            Point::new(BATT_X + 8, BADGE_Y + 3),
+            Point::new(BATT_X + 13, BADGE_Y - 1),
+            Point::new(BATT_X + 9, BADGE_Y - 1),
+        )
+        .into_styled(bolt)
+        .draw(fbuf)
+        .ok();
+    }
+
+    let style = MonoTextStyle::new(&FONT_6X10, GREY);
+    let text_style = TextStyleBuilder::new()
+        .alignment(Alignment::Center)
+        .baseline(Baseline::Middle)
+        .build();
+    Text::with_text_style(
+        &format!("{pct}%"),
+        Point::new(BATT_X + 10, BADGE_Y + 14),
+        style,
+        text_style,
+    )
+    .draw(fbuf)
+    .ok();
 }
 
 /// Cards in the swipe stack: the assistant (0), the configure actions (1) and the
@@ -560,10 +744,10 @@ pub async fn render<DI, RST>(
                 .ok();
             wrapped_text(&mut fbuf, step, H / 2 + 26, 28, 2, GREY);
         }
-        UiState::Idle { wifi_ok, exchanges } => {
+        UiState::Idle { wifi_ok, exchanges, battery } => {
             ring(&mut fbuf, DIM);
             draw_mic(&mut fbuf, GREY);
-            // Sits between the mic glyph (which ends at y=136) and the status
+            // Sits between the mic glyph (which ends at y=135) and the status
             // line at y=206, and is drawn only when there is history to
             // report - a fresh device looks exactly as it did before.
             if *exchanges > 0 {
@@ -579,6 +763,9 @@ pub async fn render<DI, RST>(
                     .ok();
             }
             status_text(&mut fbuf, "tap to talk", GREY);
+            if let Some(batt) = battery {
+                draw_battery(&mut fbuf, *batt);
+            }
             draw_wifi_dot(&mut fbuf, *wifi_ok);
             page_dots(&mut fbuf, 0);
         }
@@ -651,7 +838,13 @@ pub async fn render<DI, RST>(
         UiState::Error(msg) => {
             ring(&mut fbuf, RED);
             big_label(&mut fbuf, "!", RED);
-            wrapped_text(&mut fbuf, msg, H - 40, 28, 2, RED);
+            // 22 chars at y=188, not 28 at y=200. The old numbers were the one
+            // place on any card where a full-width line actually collided with
+            // the bezel: two lines centered on y=200 sit at y=194 and y=206, and
+            // at y=206 the inscribed circle is only 78px either side of the axis
+            // while 28 chars of FONT_6X10 is 84. Lifting the block to y=188 and
+            // capping it at 132px wide leaves ~23px of gutter on the worst line.
+            wrapped_text(&mut fbuf, msg, H - 52, 22, 2, RED);
         }
         UiState::Menu { title, rows } => draw_menu(&mut fbuf, title, rows),
         UiState::Settings { entries, offset } => draw_settings(&mut fbuf, entries, *offset),
