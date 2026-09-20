@@ -17,6 +17,8 @@ mod touch;
 mod wav;
 #[path = "../ui.rs"]
 mod ui;
+#[path = "../diff.rs"]
+mod diff;
 #[path = "../settings.rs"]
 mod settings;
 #[path = "../portal.rs"]
@@ -433,7 +435,11 @@ async fn main(spawner: Spawner) -> ! {
         .expect("display init failed");
     backlight.set_low(); // active-low backlight enable
 
-    let mut ui_frame = vec![0u8; pins::DISPLAY_WIDTH as usize * pins::DISPLAY_HEIGHT as usize * 2];
+    let mut ui_frame = vec![0u8; diff::FRAME_BYTES * 2];
+    // The first half is the draw buffer the renderer writes each frame; the
+    // second half is the diff module's copy of what the panel currently
+    // shows. It starts zeroed (never equal to the first boot frame), so the
+    // very first flush paints the full screen.
     // From here until the main loop starts, every milestone repaints the boot
     // card. The device is unresponsive to touch for several seconds while the
     // codec comes up and wifi joins, and showing the idle "tap to talk" screen
@@ -1949,8 +1955,8 @@ fn pulse_led(led: &mut StatusLed, (r, g, b): (u8, u8, u8), tick: u32) {
 
 /// Renders a state *and* sets the status LED from it.
 ///
-/// Everything past LED init goes through here rather than calling
-/// `ui::render` directly, so there is no way to change what's on screen
+/// Everything past LED init goes through here rather than calling the
+/// renderer directly, so there is no way to change what's on screen
 /// without the light following along.
 async fn show<DI, RST>(
     display: &mut lcd_async::Display<DI, GC9A01, RST>,
@@ -1963,7 +1969,9 @@ async fn show<DI, RST>(
     RST: embedded_hal::digital::OutputPin,
 {
     set_led(led, state);
-    ui::render(display, ui_frame, state, anim_tick).await;
+    let (frame, prev) = ui_frame.split_at_mut(diff::FRAME_BYTES);
+    ui::draw(frame, state, anim_tick);
+    diff::flush_changed(display, prev, frame).await;
 }
 
 fn drain_taps() {
@@ -2506,7 +2514,9 @@ async fn boot_screen<DI, RST>(
     DI: lcd_async::interface::Interface<Word = u8>,
     RST: embedded_hal::digital::OutputPin,
 {
-    ui::render(display, ui_frame, &UiState::Boot { step, progress }, 0).await;
+    let (frame, prev) = ui_frame.split_at_mut(diff::FRAME_BYTES);
+    ui::draw(frame, &UiState::Boot { step, progress }, 0);
+    diff::flush_changed(display, prev, frame).await;
 }
 
 /// How a call to [`speak`] ended.

@@ -18,7 +18,7 @@ use embedded_graphics::{
     },
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
-use lcd_async::{interface::Interface, models::GC9A01, raw_framebuf::RawFrameBuf, Display};
+use lcd_async::raw_framebuf::RawFrameBuf;
 
 use crate::pins::{DISPLAY_HEIGHT, DISPLAY_WIDTH};
 
@@ -698,16 +698,9 @@ fn draw_settings(fbuf: &mut RawFrameBuf<Rgb565, &mut [u8]>, entries: &[SettingEn
 }
 
 /// Renders one state into `frame` (a persistent 240*240*2-byte PSRAM buffer
-/// you own and reuse across calls) and flushes it to the display.
-pub async fn render<DI, RST>(
-    display: &mut Display<DI, GC9A01, RST>,
-    frame: &mut [u8],
-    state: &UiState,
-    anim_tick: u32,
-) where
-    DI: Interface<Word = u8>,
-    RST: embedded_hal::digital::OutputPin,
-{
+/// you own and reuse across calls). Pure drawing - nothing reaches the
+/// panel until the caller flushes (see `diff::flush_changed`).
+pub fn draw(frame: &mut [u8], state: &UiState, anim_tick: u32) {
     let mut fbuf = RawFrameBuf::<Rgb565, _>::new(
         &mut frame[..],
         DISPLAY_WIDTH as usize,
@@ -885,9 +878,5 @@ pub async fn render<DI, RST>(
             wrapped_text(&mut fbuf, body, H / 2 + 12, 28, 4, WHITE);
         }
     }
-
-    display
-        .show_raw_data(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, frame)
-        .await
-        .ok();
 }
+

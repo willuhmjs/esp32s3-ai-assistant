@@ -39,6 +39,7 @@ use embassy_net::{
 use embassy_time::{Duration, Timer};
 use esp_println::println;
 
+use crate::diff;
 use crate::settings::{Settings, FIELD_ORDER};
 use crate::touch::TouchEvent;
 use crate::ui::{self, UiState};
@@ -131,7 +132,9 @@ where
                 url: PORTAL_URL.into(),
                 clients: clients.get(),
             };
-            ui::render(display, ui_frame, &state, anim).await;
+            let (frame, prev) = ui_frame.split_at_mut(diff::FRAME_BYTES);
+            ui::draw(frame, &state, anim);
+            diff::flush_changed(display, prev, frame).await;
             anim = anim.wrapping_add(1);
             // Re-render on a slow tick so the client counter appears, but bail
             // out the instant the user taps.
